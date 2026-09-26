@@ -1,0 +1,143 @@
+name: Product CI Production
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  test-product-api:
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:latest
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval \"db.adminCommand('ping').ok\""
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check syntax
+        run: |
+          node --check src/server.js
+          node --check src/app.js
+          node --check src/config/db.js
+          node --check src/models/product.model.js
+          node --check src/controllers/product.controller.js
+          node --check src/routes/product.routes.js
+
+      - name: Start Product API
+        env:
+          PORT: 3000
+          MONGO_URI: mongodb://127.0.0.1:27017/productdb
+        run: |
+          npm start > server.log 2>&1 &
+          echo $! > server.pid
+
+      - name: Wait for Product API healthcheck
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://localhost:3000/health; then
+              echo ""
+              echo "Product API is healthy"
+              exit 0
+            fi
+
+            echo "Waiting for Product API..."
+            sleep 2
+          done
+
+          echo "Product API failed to become healthy"
+          cat server.log
+          exit 1
+
+      - name: Test CREATE Product
+        run: |
+          RESPONSE=$(curl -fsS \
+            -X POST http://localhost:3000/api/products \
+            -H "Content-Type: application/json" \
+            -d '{
+              "pid": "CI001",
+              "pname": "CI Laptop",
+              "price": 15000000,
+              "quantity": 10
+            }')
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep '"pid":"CI001"'
+
+      - name: Test GET all Products
+        run: |
+          RESPONSE=$(curl -fsS http://localhost:3000/api/products)
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep '"pid":"CI001"'
+
+      - name: Test GET Product by pid
+        run: |
+          RESPONSE=$(curl -fsS http://localhost:3000/api/products/CI001)
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep '"pid":"CI001"'
+
+      - name: Test UPDATE Product
+        run: |
+          RESPONSE=$(curl -fsS \
+            -X PUT http://localhost:3000/api/products/CI001 \
+            -H "Content-Type: application/json" \
+            -d '{
+              "pname": "CI Laptop Updated",
+              "price": 18000000,
+              "quantity": 8
+            }')
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep '"pname":"CI Laptop Updated"'
+          echo "$RESPONSE" | grep '"quantity":8'
+
+      - name: Test DELETE Product
+        run: |
+          RESPONSE=$(curl -fsS \
+            -X DELETE http://localhost:3000/api/products/CI001)
+
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep 'Product deleted successfully'
+
+      - name: Verify Product deleted
+        run: |
+          STATUS=$(curl -s -o response.json -w "%{http_code}" \
+            http://localhost:3000/api/products/CI001)
+
+          cat response.json
+
+          if [ "$STATUS" != "404" ]; then
+            echo "Expected HTTP 404 but received $STATUS"
+            exit 1
+          fi
+
+      - name: Build production Docker image
+        run: docker build -t product-api:prod .
+
+      - name: Show API logs if workflow fails
+        if: failure()
+        run: cat server.log
