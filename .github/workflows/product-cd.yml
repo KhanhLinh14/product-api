@@ -81,43 +81,25 @@ jobs:
     needs: ci-and-push
     runs-on: [self-hosted, Windows, X64]
 
+    defaults:
+      run:
+        shell: cmd
+
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
 
+      - name: Check Docker
+        run: docker version
+
       - name: Pull latest Docker images
-        run: docker compose -f docker-compose-prod.yaml pull
+        run: docker compose -p product-api -f docker-compose-prod.yaml pull
 
       - name: Deploy to local Docker Engine
-        run: docker compose -f docker-compose-prod.yaml up -d --force-recreate
+        run: docker compose -p product-api -f docker-compose-prod.yaml up -d --force-recreate
 
       - name: Wait for local Product API healthcheck
-        shell: powershell
-        run: |
-          for ($i = 1; $i -le 30; $i++) {
-            try {
-              $response = Invoke-WebRequest `
-                -Uri "http://localhost:3000/health" `
-                -UseBasicParsing `
-                -TimeoutSec 5
-
-              if ($response.StatusCode -eq 200) {
-                Write-Host "Product API is healthy"
-                Write-Host $response.Content
-                exit 0
-              }
-            }
-            catch {
-              Write-Host "Waiting for Product API..."
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          Write-Host "Product API failed healthcheck"
-          docker compose -f docker-compose-prod.yaml ps
-          docker compose -f docker-compose-prod.yaml logs product-api
-          exit 1
+        run: curl.exe -fsS --retry 30 --retry-delay 2 --retry-connrefused http://localhost:3000/health
 
       - name: Show deployed containers
-        run: docker compose -f docker-compose-prod.yaml ps
+        run: docker compose -p product-api -f docker-compose-prod.yaml ps
