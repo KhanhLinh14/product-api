@@ -80,6 +80,7 @@ jobs:
   deploy-local:
     needs: ci-and-push
     runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 10
 
     defaults:
       run:
@@ -95,11 +96,17 @@ jobs:
       - name: Pull latest Docker images
         run: docker compose -p product-api -f docker-compose-prod.yaml pull
 
-      - name: Deploy to local Docker Engine
-        run: docker compose -p product-api -f docker-compose-prod.yaml up -d --force-recreate
+      - name: Deploy and wait for healthy containers
+        run: docker compose -p product-api -f docker-compose-prod.yaml up -d --force-recreate --wait --wait-timeout 90
 
-      - name: Wait for local Product API healthcheck
-        run: curl.exe -fsS --retry 30 --retry-delay 2 --retry-connrefused http://localhost:3000/health
+      - name: Check local Product API health
+        run: curl.exe -fsS http://localhost:3000/health
 
       - name: Show deployed containers
         run: docker compose -p product-api -f docker-compose-prod.yaml ps
+
+      - name: Show deployment logs on failure
+        if: failure()
+        run: |
+          docker compose -p product-api -f docker-compose-prod.yaml ps
+          docker compose -p product-api -f docker-compose-prod.yaml logs --tail=100
