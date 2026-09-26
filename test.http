@@ -1,0 +1,32 @@
+### 1. Kiểm tra API
+GET http://localhost:3000/
+
+### 2. Tạo sản phẩm
+POST http://localhost:3000/api/products
+Content-Type: application/json
+
+{
+  "pid": "P001",
+  "pname": "Laptop",
+  "price": 15000000,
+  "quantity": 10
+}
+
+### 3. Lấy tất cả sản phẩm
+GET http://localhost:3000/api/products
+
+### 4. Lấy sản phẩm theo pid
+GET http://localhost:3000/api/products/P001
+
+### 5. Cập nhật sản phẩm
+PUT http://localhost:3000/api/products/P001
+Content-Type: application/json
+
+{
+  "pname": "Laptop Gaming",
+  "price": 18000000,
+  "quantity": 8
+}
+
+### 6. Xóa sản phẩm
+DELETE http://localhost:3000/api/products/P001
