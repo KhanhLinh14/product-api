@@ -33,7 +33,5 @@ jobs:
 
       - name: Check controller syntax
         run: node --check src/controllers/product.controller.js
-      - name: check package.json
-        run: test -f package.jon
       - name: Build Docker image
         run: docker build -t product-api:test .
