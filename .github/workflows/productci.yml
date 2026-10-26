@@ -1,28 +1,30 @@
+
 name: Product API CI/CD
 
 on:
   push:
     branches:
       - main
-
   pull_request:
     branches:
       - main
 
 jobs:
+  # JOB 1: TEST CRUD
   test:
     runs-on: ubuntu-latest
 
     services:
       mongodb:
-        image: mongo:8.0
+        image: mongo:8.3
         ports:
           - 27017:27017
         options: >-
-          --health-cmd "mongosh --quiet --eval \"db.adminCommand('ping')\""
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' || exit 1"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
+          --health-start-period 15s
 
     env:
       MONGO_URI_TEST: mongodb://127.0.0.1:27017/productdb_test
@@ -46,7 +48,7 @@ jobs:
       - name: Run CRUD tests
         run: npm test
 
-
+  # JOB 2: HEALTHCHECK
   healthcheck:
     needs: test
     runs-on: ubuntu-latest
@@ -59,12 +61,10 @@ jobs:
         run: |
           echo "PORT=3000" > .env
           echo "MONGO_URI=mongodb://mongodb:27017/productdb" >> .env
+          echo "MONGO_URI_TEST=mongodb://127.0.0.1:27018/productdb_test" >> .env
 
-      - name: Start application with Docker Compose
-        run: docker compose up -d --build
-
-      - name: Wait for containers
-        run: sleep 15
+      - name: Start Docker Compose
+        run: docker compose up -d --build --wait --wait-timeout 120
 
       - name: Check container status
         run: docker compose ps
@@ -82,19 +82,26 @@ jobs:
           test "$STATUS" = "healthy"
 
       - name: Test health endpoint
-        run: curl --fail http://localhost:3000/health
+        run: curl --fail --retry 5 --retry-delay 3 http://localhost:3000/health
+
+      - name: Show logs if failed
+        if: failure()
+        run: docker compose logs --tail=100
 
       - name: Stop containers
         if: always()
-        run: docker compose down -v
+        run: docker compose down
 
-
+  # JOB 3: DOCKER HUB
   docker:
     needs:
       - test
       - healthcheck
 
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_DOCKER_PUBLISH == 'true'
 
     runs-on: ubuntu-latest
 
@@ -120,11 +127,14 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/product-api:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/product-api:${{ github.sha }}
 
-
+  # JOB 4: DEPLOY LOCAL
   deploy-local:
     needs: docker
 
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_LOCAL_DEPLOY == 'true'
 
     runs-on:
       - self-hosted
@@ -135,13 +145,17 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Pull latest image from Docker Hub
-        run: docker pull pgb30z/product-api:latest
+      - name: Pull latest image
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: docker pull "${env:DOCKERHUB_USERNAME}/product-api:latest"
 
       - name: Stop old production containers
         run: docker compose -f docker-compose-prod.yaml down
 
       - name: Start production containers
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: docker compose -f docker-compose-prod.yaml up -d
 
       - name: Check production containers
@@ -159,8 +173,8 @@ jobs:
           Write-Host "Product API health: $status"
 
           if ($status -ne "healthy") {
-              docker logs product-api-prod
-              exit 1
+            docker logs product-api-prod
+            exit 1
           }
 
       - name: Test health endpoint
@@ -173,5 +187,5 @@ jobs:
           Write-Host $response.Content
 
           if ($response.StatusCode -ne 200) {
-              exit 1
+            exit 1
           }
