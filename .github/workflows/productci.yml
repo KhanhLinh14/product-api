@@ -1,34 +1,22 @@
+
 name: Product API CI/CD
 
 on:
   push:
-    branches:
-      - main
-
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
+  # JOB 1: CRUD TEST
   test:
     runs-on: ubuntu-latest
-
-    services:
-      mongodb:
-        image: mongo:8.3
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --quiet --eval \"db.adminCommand('ping')\""
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
 
     env:
       MONGO_URI_TEST: mongodb://127.0.0.1:27017/productdb_test
 
     steps:
-      - name: Checkout source code
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -41,66 +29,143 @@ jobs:
         run: npm ci
 
       - name: Check JavaScript syntax
-        run: node --check server.js
+        run: |
+          node --check server.js
+          node --check app.js
+
+      - name: Start test MongoDB
+        run: |
+          docker run -d \
+            --name mongodb-test \
+            -p 27017:27017 \
+            mongo:7.0
+
+      - name: Wait for MongoDB
+        run: |
+          for i in {1..30}; do
+            echo "MongoDB attempt $i"
+
+            if [ "$(docker inspect -f '{{.State.Running}}' mongodb-test)" != "true" ]; then
+              echo "MongoDB container stopped"
+              docker logs --tail 100 mongodb-test
+              exit 1
+            fi
+
+            if docker exec mongodb-test mongosh \
+              --quiet \
+              --eval 'quit(db.adminCommand({ping:1}).ok === 1 ? 0 : 1)'; then
+              echo "MongoDB is ready"
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "MongoDB startup timed out"
+          docker logs --tail 100 mongodb-test
+          exit 1
 
       - name: Run CRUD tests
         run: npm test
 
+      - name: Show MongoDB logs on failure
+        if: failure()
+        run: docker logs --tail 100 mongodb-test || true
 
+      - name: Cleanup test database
+        if: always()
+        run: docker rm -f mongodb-test || true
+
+  # JOB 2: DOCKER COMPOSE HEALTHCHECK
   healthcheck:
     needs: test
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source code
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Create CI env file
         run: |
           echo "PORT=3000" > .env
           echo "MONGO_URI=mongodb://mongodb:27017/productdb" >> .env
+          echo "MONGO_URI_TEST=mongodb://127.0.0.1:27018/productdb_test" >> .env
 
-      - name: Start application with Docker Compose
-        run: docker compose up -d --build
+      - name: Create temporary CI Compose override
+        run: |
+          cat > docker-compose.ci.yml <<'EOF'
+          services:
+            mongodb:
+              image: mongo:7.0
+          EOF
 
-      - name: Wait for containers
-        run: sleep 15
+      - name: Start containers
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.ci.yml \
+            up -d --build --wait --wait-timeout 120
 
       - name: Check container status
-        run: docker compose ps
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.ci.yml \
+            ps
 
       - name: Check MongoDB health
         run: |
-          STATUS=$(docker inspect --format='{{.State.Health.Status}}' nammongodb)
-          echo "MongoDB health: $STATUS"
+          STATUS=$(docker inspect \
+            --format='{{.State.Health.Status}}' nammongodb)
+          echo "MongoDB: $STATUS"
           test "$STATUS" = "healthy"
 
       - name: Check Product API health
         run: |
-          STATUS=$(docker inspect --format='{{.State.Health.Status}}' product-api-container)
-          echo "Product API health: $STATUS"
+          STATUS=$(docker inspect \
+            --format='{{.State.Health.Status}}' product-api-container)
+          echo "Product API: $STATUS"
           test "$STATUS" = "healthy"
 
-      - name: Test health endpoint
-        run: curl --fail http://localhost:3000/health
+      - name: Test API endpoint
+        run: |
+          curl --fail \
+            --retry 5 \
+            --retry-delay 3 \
+            http://localhost:3000/health
 
-      - name: Stop containers
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.ci.yml \
+            logs --tail=100
+
+      - name: Cleanup CI containers
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.ci.yml \
+            down -v || true
 
-
+  # JOB 3: BUILD AND PUSH DOCKER HUB
   docker:
-    needs:
-      - test
-      - healthcheck
-
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, healthcheck]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_DOCKER_PUBLISH == 'true'
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source code
+      - name: Checkout source
         uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to Docker Hub
         uses: docker/login-action@v4
@@ -108,70 +173,74 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build and push Docker image
+      - name: Build and push image
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/product-api:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/product-api:${{ github.sha }}
+            khanhlinh14/product-api:latest
+            khanhlinh14/product-api:${{ github.sha }}
 
-
+  # JOB 4: DEPLOY WINDOWS RUNNER
   deploy-local:
     needs: docker
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ENABLE_DOCKER_PUBLISH == 'true' &&
+      vars.ENABLE_LOCAL_DEPLOY == 'true'
 
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64]
 
-    runs-on:
-      - self-hosted
-      - Windows
-      - X64
+    defaults:
+      run:
+        shell: powershell
 
     steps:
-      - name: Checkout source code
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Pull latest image from Docker Hub
-        run: docker pull pgb30z/product-api:latest
-
-      - name: Stop old production containers
-        run: docker compose -f docker-compose-prod.yaml down
+      - name: Pull Docker Hub image
+        run: |
+          docker pull khanhlinh14/product-api:latest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Start production containers
-        run: docker compose -f docker-compose-prod.yaml up -d
+        run: |
+          docker compose -f docker-compose-prod.yaml up -d --pull always
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Check production containers
-        run: docker compose -f docker-compose-prod.yaml ps
-
-      - name: Wait for Product API
-        shell: powershell
-        run: Start-Sleep -Seconds 15
-
-      - name: Check Product API health
-        shell: powershell
         run: |
-          $status = docker inspect --format='{{.State.Health.Status}}' product-api-prod
+          docker compose -f docker-compose-prod.yaml ps
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
-          Write-Host "Product API health: $status"
+      - name: Wait for production API
+        run: |
+          $ready = $false
 
-          if ($status -ne "healthy") {
-              docker logs product-api-prod
-              exit 1
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $response = Invoke-WebRequest `
+                -Uri "http://localhost:3002/health" `
+                -UseBasicParsing `
+                -TimeoutSec 5
+
+              if ($response.StatusCode -eq 200) {
+                $ready = $true
+                break
+              }
+            } catch {
+              Write-Host "Waiting for API attempt $i"
+            }
+
+            Start-Sleep -Seconds 3
           }
 
-      - name: Test health endpoint
-        shell: powershell
-        run: |
-          $response = Invoke-WebRequest `
-            -Uri "http://localhost:3000/health" `
-            -UseBasicParsing
-
-          Write-Host $response.Content
-
-          if ($response.StatusCode -ne 200) {
-              exit 1
+          if (-not $ready) {
+            docker logs --tail 100 product-api-prod
+            exit 1
           }
+
+          Write-Host "Production API is healthy"
