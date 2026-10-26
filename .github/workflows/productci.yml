@@ -1,0 +1,177 @@
+name: Product API CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:8.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval \"db.adminCommand('ping')\""
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      MONGO_URI_TEST: mongodb://127.0.0.1:27017/productdb_test
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check JavaScript syntax
+        run: node --check server.js
+
+      - name: Run CRUD tests
+        run: npm test
+
+
+  healthcheck:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Create CI env file
+        run: |
+          echo "PORT=3000" > .env
+          echo "MONGO_URI=mongodb://mongodb:27017/productdb" >> .env
+
+      - name: Start application with Docker Compose
+        run: docker compose up -d --build
+
+      - name: Wait for containers
+        run: sleep 15
+
+      - name: Check container status
+        run: docker compose ps
+
+      - name: Check MongoDB health
+        run: |
+          STATUS=$(docker inspect --format='{{.State.Health.Status}}' nammongodb)
+          echo "MongoDB health: $STATUS"
+          test "$STATUS" = "healthy"
+
+      - name: Check Product API health
+        run: |
+          STATUS=$(docker inspect --format='{{.State.Health.Status}}' product-api-container)
+          echo "Product API health: $STATUS"
+          test "$STATUS" = "healthy"
+
+      - name: Test health endpoint
+        run: curl --fail http://localhost:3000/health
+
+      - name: Stop containers
+        if: always()
+        run: docker compose down -v
+
+
+  docker:
+    needs:
+      - test
+      - healthcheck
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/product-api:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/product-api:${{ github.sha }}
+
+
+  deploy-local:
+    needs: docker
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Pull latest image from Docker Hub
+        run: docker pull pgb30z/product-api:latest
+
+      - name: Stop old production containers
+        run: docker compose -f docker-compose-prod.yaml down
+
+      - name: Start production containers
+        run: docker compose -f docker-compose-prod.yaml up -d
+
+      - name: Check production containers
+        run: docker compose -f docker-compose-prod.yaml ps
+
+      - name: Wait for Product API
+        shell: powershell
+        run: Start-Sleep -Seconds 15
+
+      - name: Check Product API health
+        shell: powershell
+        run: |
+          $status = docker inspect --format='{{.State.Health.Status}}' product-api-prod
+
+          Write-Host "Product API health: $status"
+
+          if ($status -ne "healthy") {
+              docker logs product-api-prod
+              exit 1
+          }
+
+      - name: Test health endpoint
+        shell: powershell
+        run: |
+          $response = Invoke-WebRequest `
+            -Uri "http://localhost:3000/health" `
+            -UseBasicParsing
+
+          Write-Host $response.Content
+
+          if ($response.StatusCode -ne 200) {
+              exit 1
+          }
