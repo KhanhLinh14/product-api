@@ -14,18 +14,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    services:
-      mongodb:
-        image: mongo:8.3
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok' || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 15s
-
     env:
       MONGO_URI_TEST: mongodb://127.0.0.1:27017/productdb_test
 
@@ -42,11 +30,39 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Start MongoDB
+        run: |
+          docker run -d \
+            --name mongodb-test \
+            -p 27017:27017 \
+            mongo:8.3
+
+      - name: Wait for MongoDB
+        run: |
+          for i in {1..30}; do
+            if docker exec mongodb-test mongosh --quiet \
+              --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 1)'; then
+              echo "MongoDB is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs mongodb-test
+          exit 1
+
       - name: Check JavaScript syntax
         run: node --check server.js
 
       - name: Run CRUD tests
         run: npm test
+
+      - name: Show MongoDB logs if failed
+        if: failure()
+        run: docker logs mongodb-test || true
+
+      - name: Stop MongoDB
+        if: always()
+        run: docker rm -f mongodb-test || true
 
   # JOB 2: HEALTHCHECK
   healthcheck:
@@ -64,7 +80,8 @@ jobs:
           echo "MONGO_URI_TEST=mongodb://127.0.0.1:27018/productdb_test" >> .env
 
       - name: Start Docker Compose
-        run: docker compose up -d --build --wait --wait-timeout 120
+        run: |
+          docker compose up -d --build --wait --wait-timeout 120
 
       - name: Check container status
         run: docker compose ps
@@ -82,7 +99,9 @@ jobs:
           test "$STATUS" = "healthy"
 
       - name: Test health endpoint
-        run: curl --fail --retry 5 --retry-delay 3 http://localhost:3000/health
+        run: |
+          curl --fail --retry 5 --retry-delay 3 \
+            http://localhost:3000/health
 
       - name: Show logs if failed
         if: failure()
@@ -92,7 +111,7 @@ jobs:
         if: always()
         run: docker compose down
 
-  # JOB 3: DOCKER HUB
+  # JOB 3: BUILD AND PUSH DOCKER
   docker:
     needs:
       - test
@@ -127,7 +146,7 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/product-api:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/product-api:${{ github.sha }}
 
-  # JOB 4: DEPLOY LOCAL
+  # JOB 4: DEPLOY TO LOCAL WINDOWS
   deploy-local:
     needs: docker
 
@@ -145,21 +164,29 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      - name: Pull latest image
+      - name: Pull latest Docker image
+        shell: powershell
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: docker pull "${env:DOCKERHUB_USERNAME}/product-api:latest"
+        run: |
+          docker pull "$env:DOCKERHUB_USERNAME/product-api:latest"
 
       - name: Stop old production containers
-        run: docker compose -f docker-compose-prod.yaml down
+        shell: powershell
+        run: |
+          docker compose -f docker-compose-prod.yaml down
 
       - name: Start production containers
+        shell: powershell
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: docker compose -f docker-compose-prod.yaml up -d
+        run: |
+          docker compose -f docker-compose-prod.yaml up -d
 
       - name: Check production containers
-        run: docker compose -f docker-compose-prod.yaml ps
+        shell: powershell
+        run: |
+          docker compose -f docker-compose-prod.yaml ps
 
       - name: Wait for Product API
         shell: powershell
